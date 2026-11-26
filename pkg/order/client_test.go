@@ -121,6 +121,65 @@ func TestSearch(t *testing.T) {
 	}
 }
 
+// TestSearchQueryControls verifies that documented controls are encoded in the
+// URL (not the body), that SearchResponse decodes data and paging, and that
+// legacy limit/offset remain usable through the public client.
+func TestSearchQueryControls(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		request SearchRequest
+		query   string
+	}{
+		{
+			name: "documented pagination and sorting",
+			request: SearchRequest{
+				Page: 2, PageSize: 20, SortBy: "created_date", SortOrder: "desc",
+				BeginDate: "2025-11-01T00:00:00.000Z", EndDate: "2025-11-11T23:59:59.999Z",
+				Filters: map[string]string{"status": "processed"},
+			},
+			query: "begin_date=2025-11-01T00%3A00%3A00.000Z&end_date=2025-11-11T23%3A59%3A59.999Z&page=2&page_size=20&sort_by=created_date&sort_order=desc&status=processed",
+		},
+		{
+			name: "legacy limit and offset with filters",
+			request: SearchRequest{
+				Limit: 30, Offset: 10,
+				Filters: map[string]string{"begin_date": "2025-11-01T00:00:00Z", "end_date": "2025-11-11T00:00:00Z", "external_reference": "ext_ref_1234"},
+			},
+			query: "begin_date=2025-11-01T00%3A00%3A00Z&end_date=2025-11-11T00%3A00%3A00Z&external_reference=ext_ref_1234&limit=30&offset=10",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{Requester: &httpclient.Mock{DoMock: func(req *http.Request) (*http.Response, error) {
+				if req.Method != http.MethodGet || req.URL.Path != "/v1/orders" {
+					t.Errorf("request = %s %s, want GET /v1/orders", req.Method, req.URL.Path)
+				}
+				if req.URL.RawQuery != tt.query {
+					t.Errorf("raw query = %q, want %q", req.URL.RawQuery, tt.query)
+				}
+				if req.Body != nil && req.Body != http.NoBody {
+					t.Error("search controls must not be sent in a request body")
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body: io.NopCloser(strings.NewReader(string(searchResponse))),
+					Header: make(http.Header),
+				}, nil
+			}}}
+			got, err := NewClient(cfg).Search(context.Background(), tt.request)
+			if err != nil {
+				t.Fatalf("Search() error = %v", err)
+			}
+			want := &SearchResponse{
+				Data: []Response{{ID: "01JDNPJ7XJSV1YS2W3JXEJNQ8", Status: "processed", StatusDetail: "accredited", TotalAmount: "100.00", Currency: "BRL"}},
+				Paging: &PagingResponse{Total: "1", TotalPages: "1", Offset: "0", Limit: "30"},
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("Search() = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
 func TestCreate(t *testing.T) {
 	type fields struct {
 		cfg *config.Config
@@ -1595,5 +1654,275 @@ func TestCreate_TransactionSecurity_Simple(t *testing.T) {
 	c := &client{cfg: cfg}
 	if _, err := c.Create(context.Background(), reqBody); err != nil {
 		t.Fatalf("Create() error: %v", err)
+	}
+}
+
+// TestCreatePointWire ensures Point-specific properties stay in the JSON body
+// and the idempotency key remains an HTTP header.
+func TestCreatePointWire(t *testing.T) {
+	body := Request{Type: "point", ExternalReference: "point-ref", ExpirationTime: "PT2M", ProcessingMode: "manual"}
+	cfg := &config.Config{Requester: &httpclient.Mock{DoMock: func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost || req.URL.Path != "/v1/orders" {
+			t.Errorf("request = %s %s, want POST /v1/orders", req.Method, req.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			return nil, err
+		}
+		for key, want := range map[string]any{"type": "point", "external_reference": "point-ref", "expiration_time": "PT2M", "processing_mode": "manual"} {
+			if payload[key] != want {
+				t.Errorf("body[%q] = %v, want %v", key, payload[key], want)
+			}
+		}
+		if _, ok := payload["X-Idempotency-Key"]; ok {
+			t.Error("idempotency key must not be a JSON property")
+		}
+		if req.Header.Get("X-Idempotency-Key") == "" {
+			t.Error("missing idempotency header")
+		}
+		return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"id":"point-order","type":"point","external_reference":"point-ref","expiration_time":"PT2M","processing_mode":"manual"}`)), Header: make(http.Header)}, nil
+	}}}
+	got, err := NewClient(cfg).Create(context.Background(), body)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if got.ID != "point-order" || got.Type != "point" || got.ExternalReference != "point-ref" || got.ExpirationTime != "PT2M" || got.ProcessingMode != "manual" {
+		t.Errorf("Create() response = %+v", got)
+	}
+}
+
+// TestQRPublicClientWire exercises the QR lifecycle through the unchanged public
+// Client interface and checks request placement and nested response decoding.
+func TestQRPublicClientWire(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path, response string
+		call                         func(Client) (*Response, error)
+		check                        func(*testing.T, *Response)
+	}{
+		{
+			name: "create", method: http.MethodPost, path: "/v1/orders",
+			response: `{"id":"qr-order","type":"qr","type_response":{"qr_data":"qr-payload"},"discounts":{"payment_methods":[{"type":"account_money","new_total_amount":"90.00"}]}}`,
+			call: func(c Client) (*Response, error) {
+				return c.Create(context.Background(), Request{Type: "qr", TotalAmount: "100.00", Transactions: &TransactionRequest{Payments: []PaymentRequest{{Amount: "100.00"}}}})
+			},
+			check: func(t *testing.T, r *Response) {
+				if r.TypeResponse == nil || r.TypeResponse.QrData != "qr-payload" || r.Discounts == nil || len(r.Discounts.PaymentMethods) != 1 || r.Discounts.PaymentMethods[0].Type != "account_money" || r.Discounts.PaymentMethods[0].NewTotalAmount != "90.00" {
+					t.Errorf("QR create response = %+v", r)
+				}
+			},
+		},
+		{
+			name: "get", method: http.MethodGet, path: "/v1/orders/qr-order",
+			response: `{"id":"qr-order","type":"qr","status":"processed","type_response":{"qr_data":"qr-payload"}}`,
+			call: func(c Client) (*Response, error) { return c.Get(context.Background(), "qr-order") },
+			check: func(t *testing.T, r *Response) {
+				if r.Status != "processed" || r.TypeResponse == nil || r.TypeResponse.QrData != "qr-payload" {
+					t.Errorf("QR get response = %+v", r)
+				}
+			},
+		},
+		{
+			name: "cancel", method: http.MethodPost, path: "/v1/orders/qr-order/cancel",
+			response: `{"id":"qr-order","type":"qr","status":"cancelled"}`,
+			call: func(c Client) (*Response, error) { return c.Cancel(context.Background(), "qr-order") },
+			check: func(t *testing.T, r *Response) {
+				if r.Status != "cancelled" {
+					t.Errorf("QR cancel response = %+v", r)
+				}
+			},
+		},
+		{
+			name: "refund", method: http.MethodPost, path: "/v1/orders/qr-order/refund",
+			response: `{"id":"qr-order","type":"qr","status":"refunded","transactions":{"refunds":[{"id":"refund-1","amount":"10.00"}]}}`,
+			call: func(c Client) (*Response, error) {
+				return c.Refund(context.Background(), "qr-order", &RefundRequest{Transactions: []RefundTransaction{{ID: "payment-1", Amount: "10.00"}}})
+			},
+			check: func(t *testing.T, r *Response) {
+				if r.Status != "refunded" || len(r.Transactions.Refunds) != 1 || r.Transactions.Refunds[0].Amount != "10.00" {
+					t.Errorf("QR refund response = %+v", r)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{Requester: &httpclient.Mock{DoMock: func(req *http.Request) (*http.Response, error) {
+				if req.Method != tc.method || req.URL.Path != tc.path {
+					t.Errorf("request = %s %s, want %s %s", req.Method, req.URL.Path, tc.method, tc.path)
+				}
+				if tc.name == "create" || tc.name == "refund" {
+					var payload map[string]any
+					if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+						return nil, err
+					}
+					if tc.name == "create" && (payload["type"] != "qr" || payload["total_amount"] != "100.00") {
+						t.Errorf("QR create payload = %v", payload)
+					}
+					if tc.name == "refund" {
+						transactions, ok := payload["transactions"].([]any)
+						if !ok || len(transactions) != 1 || transactions[0].(map[string]any)["amount"] != "10.00" {
+							t.Errorf("QR refund payload = %v", payload)
+						}
+					}
+				}
+				return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(tc.response)), Header: make(http.Header)}, nil
+			}}}
+			got, err := tc.call(NewClient(cfg))
+			if err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if got == nil || got.ID != "qr-order" || got.Type != "qr" {
+				t.Fatalf("%s response = %+v", tc.name, got)
+			}
+			tc.check(t, got)
+		})
+	}
+}
+
+// TestWalletConnectPublicClientWire checks each Wallet Connect operation through
+// the public Client interface, without requiring a live API connection.
+func TestWalletConnectPublicClientWire(t *testing.T) {
+	const orderID = "ORDBTA01KHY4WFPYXJ9Z7S5CGED7WCTP"
+	for _, tc := range []struct {
+		name, method, path, response string
+		body                         map[string]any
+		call                         func(Client) (*Response, error)
+		check                        func(*testing.T, *Response)
+	}{
+		{
+			name: "create", method: http.MethodPost, path: "/v1/orders",
+			body: map[string]any{
+				"type": "online", "total_amount": "100.00", "external_reference": "wallet_1234",
+				"transactions": map[string]any{"payments": []any{map[string]any{
+					"amount": "100.00", "payment_method": map[string]any{
+						"id": "wallet", "type": "wallet", "token": "123abc123abc123abc123abc123abc12",
+					},
+				}}},
+			},
+			response: `{"id":"ORDBTA01KHY4WFPYXJ9Z7S5CGED7WCTP","type":"online","status":"processed","total_amount":"100.00","transactions":{"payments":[{"id":"PAY01KHY4WFPYXJ9Z7S5CGG0SE8KN","amount":"100.00","payment_method":{"id":"wallet","type":"wallet"}}]}}`,
+			call: func(c Client) (*Response, error) {
+				return c.Create(context.Background(), Request{
+					Type: "online", TotalAmount: "100.00", ExternalReference: "wallet_1234",
+					Transactions: &TransactionRequest{Payments: []PaymentRequest{{
+						Amount: "100.00", PaymentMethod: &PaymentMethodRequest{ID: "wallet", Type: "wallet", Token: "123abc123abc123abc123abc123abc12"},
+					}}},
+				})
+			},
+			check: func(t *testing.T, r *Response) {
+				if r.Type != "online" || r.TotalAmount != "100.00" || len(r.Transactions.Payments) != 1 || r.Transactions.Payments[0].PaymentMethod.ID != "wallet" {
+					t.Errorf("create response = %+v", r)
+				}
+			},
+		},
+		{
+			name: "create with sub-merchant", method: http.MethodPost, path: "/v1/orders",
+			body: map[string]any{
+				"type": "online", "total_amount": "100.00", "external_reference": "wallet_facilitator_1234",
+				"additional_info": map[string]any{"sub_merchant": map[string]any{
+					"address_door_number": float64(123), "address_street": "RUA A", "city": "Sao Paulo",
+					"country": "BR", "document_number": "12345678909", "document_type": "CPF",
+					"id": "123123", "legal_name": "LOJINHA DO ZE", "mcc": "5462",
+					"phone": "11999998888", "region_code": "BR", "region_code_iso": "BR-SP",
+					"url": "www.facilitador.com.br", "zip": "01310-100",
+				}},
+				"transactions": map[string]any{"payments": []any{map[string]any{
+					"amount": "100.00", "payment_method": map[string]any{
+						"id": "wallet", "type": "wallet", "token": "123abc123abc123abc123abc123abc12",
+					},
+				}}},
+			},
+			response: `{"id":"ORDBTA01KHY4WFPYXJ9Z7S5CGED7WCTP","type":"online","status":"processed"}`,
+			call: func(c Client) (*Response, error) {
+				return c.Create(context.Background(), Request{
+					Type: "online", TotalAmount: "100.00", ExternalReference: "wallet_facilitator_1234",
+					AdditionalInfo: &AdditionalInfoRequest{SubMerchant: &SubMerchantRequest{
+						AddressDoorNumber: 123, AddressStreet: "RUA A", City: "Sao Paulo",
+						Country: "BR", DocumentNumber: "12345678909", DocumentType: "CPF",
+						ID: "123123", LegalName: "LOJINHA DO ZE", MCC: "5462",
+						Phone: "11999998888", RegionCode: "BR", RegionCodeISO: "BR-SP",
+						URL: "www.facilitador.com.br", Zip: "01310-100",
+					}},
+					Transactions: &TransactionRequest{Payments: []PaymentRequest{{
+						Amount: "100.00", PaymentMethod: &PaymentMethodRequest{ID: "wallet", Type: "wallet", Token: "123abc123abc123abc123abc123abc12"},
+					}}},
+				})
+			},
+			check: func(t *testing.T, r *Response) {
+				if r.Type != "online" || r.Status != "processed" {
+					t.Errorf("facilitator create response = %+v", r)
+				}
+			},
+		},
+		{
+			name: "get", method: http.MethodGet, path: "/v1/orders/" + orderID,
+			response: `{"id":"ORDBTA01KHY4WFPYXJ9Z7S5CGED7WCTP","status":"processed","status_detail":"accredited","transactions":{"payments":[{"id":"PAY01KHY4WFPYXJ9Z7S5CGG0SE8KN","amount":"100.00"}]}}`,
+			call: func(c Client) (*Response, error) { return c.Get(context.Background(), orderID) },
+			check: func(t *testing.T, r *Response) {
+				if r.StatusDetail != "accredited" || len(r.Transactions.Payments) != 1 || r.Transactions.Payments[0].Amount != "100.00" {
+					t.Errorf("get response = %+v", r)
+				}
+			},
+		},
+		{
+			name: "cancel", method: http.MethodPost, path: "/v1/orders/" + orderID + "/cancel",
+			response: `{"id":"ORDBTA01KHY4WFPYXJ9Z7S5CGED7WCTP","status":"cancelled"}`,
+			call: func(c Client) (*Response, error) { return c.Cancel(context.Background(), orderID) },
+			check: func(t *testing.T, r *Response) {
+				if r.Status != "cancelled" {
+					t.Errorf("cancel response = %+v", r)
+				}
+			},
+		},
+		{
+			name: "refund", method: http.MethodPost, path: "/v1/orders/" + orderID + "/refund",
+			body: map[string]any{"transactions": []any{map[string]any{"id": "PAY01KHY4WFPYXJ9Z7S5CGG0SE8KN", "amount": "10.00"}}},
+			response: `{"id":"ORDBTA01KHY4WFPYXJ9Z7S5CGED7WCTP","status":"processed","status_detail":"partially_refunded","transactions":{"refunds":[{"id":"REF01KJZ0BPKX0BQ0KG1VPBMJDX9G","amount":"10.00","status":"processed","transaction_id":"PAY01KHY4WFPYXJ9Z7S5CGG0SE8KN"}]}}`,
+			call: func(c Client) (*Response, error) {
+				return c.Refund(context.Background(), orderID, &RefundRequest{Transactions: []RefundTransaction{{ID: "PAY01KHY4WFPYXJ9Z7S5CGG0SE8KN", Amount: "10.00"}}})
+			},
+			check: func(t *testing.T, r *Response) {
+				if r.StatusDetail != "partially_refunded" || len(r.Transactions.Refunds) != 1 || r.Transactions.Refunds[0].Amount != "10.00" {
+					t.Errorf("refund response = %+v", r)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{AccessToken: "wallet-test-token", Requester: &httpclient.Mock{DoMock: func(req *http.Request) (*http.Response, error) {
+				if req.Method != tc.method || req.URL.Path != tc.path {
+					t.Errorf("path/method = %s %s, want %s %s", req.Method, req.URL.Path, tc.method, tc.path)
+				}
+				if req.URL.RawQuery != "" {
+					t.Errorf("query = %q, want empty", req.URL.RawQuery)
+				}
+				if tc.method == http.MethodPost && req.Header.Get("X-Idempotency-Key") == "" {
+					t.Error("missing X-Idempotency-Key header")
+				}
+				if tc.body == nil {
+					if req.Body != nil && req.Body != http.NoBody {
+						t.Error("unexpected request body")
+					}
+				} else {
+					if req.Header.Get("Content-Type") != "application/json" {
+						t.Errorf("Content-Type = %q", req.Header.Get("Content-Type"))
+					}
+					var body map[string]any
+					if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+						return nil, err
+					}
+					if !reflect.DeepEqual(body, tc.body) {
+						t.Errorf("body = %#v, want %#v", body, tc.body)
+					}
+				}
+				return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(tc.response)), Header: make(http.Header)}, nil
+			}}}
+			got, err := tc.call(NewClient(cfg))
+			if err != nil {
+				t.Fatalf("%s error: %v", tc.name, err)
+			}
+			if got == nil || got.ID != orderID {
+				t.Fatalf("%s response = %+v", tc.name, got)
+			}
+			tc.check(t, got)
+		})
 	}
 }

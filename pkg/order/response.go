@@ -5,6 +5,8 @@ package order
 // Response represents the full order object returned by the MercadoPago Orders API.
 // It is the primary return type for most [Client] methods and contains the order's
 // current state, including status, amounts, transactions, items, and configuration.
+// Wallet Connect orders use this same response shape: the order status and amounts
+// are at the top level, while payment attempts and refunds are in transactions.
 type Response struct {
 	ID                  string                  `json:"id,omitempty"`
 	Type                string                  `json:"type,omitempty"`
@@ -342,6 +344,8 @@ type ExternalCategoryResponse struct {
 
 // SearchResponse represents the paginated result returned by the [Client.Search] method.
 // Data contains the matching orders and Paging provides pagination metadata.
+// SearchResponse contains the orders in data and the pagination metadata in paging.
+// Search controls are query parameters, not response fields.
 type SearchResponse struct {
 	Data   []Response      `json:"data,omitempty"`
 	Paging *PagingResponse `json:"paging,omitempty"`

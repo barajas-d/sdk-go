@@ -8,6 +8,7 @@ import (
 // Request represents the body sent to the MercadoPago Orders API when creating a new order.
 // It contains all the information needed to describe the order, including total amount,
 // payment transactions, payer details, line items, and checkout configuration.
+// X-Idempotency-Key is an HTTP header, not a request-body property.
 type Request struct {
 	Type                string                 `json:"type,omitempty"`
 	TotalAmount         string                 `json:"total_amount,omitempty"`
@@ -363,29 +364,62 @@ type TransactionSecurityRequest struct {
 	LiabilityShift string `json:"liability_shift,omitempty"`
 }
 
-// SearchRequest contains the parameters for searching orders via the [Client.Search] method.
-// Filters is a key-value map of field names to expected values. Limit defaults to 30 if zero.
+// SearchRequest contains query parameters for searching orders via [Client.Search].
+// Filters is a key-value map of additional field names to expected values.
+// Limit and Offset remain available for legacy pagination; Limit defaults to 30
+// when zero. Page and PageSize select the documented page-based pagination instead.
 type SearchRequest struct {
-	Limit   int
-	Offset  int
-	Filters map[string]string
+	Limit     int
+	Offset    int
+	Page      int
+	PageSize  int
+	SortBy    string
+	SortOrder string
+	BeginDate string
+	EndDate   string
+	Filters   map[string]string
 }
 
-// GetParams converts the [SearchRequest] into a flat map of query parameters suitable
-// for URL encoding. Filter keys are lowercased automatically. If Limit is zero it
-// defaults to 30.
+// GetParams converts the [SearchRequest] into a flat map of URL query parameters.
+// Filter keys are lowercased. Explicit fields take precedence over Filters.
+// Page-based pagination omits the legacy limit and offset parameters unless
+// either legacy parameter is explicitly set, including when page controls are
+// supplied through Filters for backwards compatibility.
 func (sr *SearchRequest) GetParams() map[string]string {
 	params := map[string]string{}
 	for k, v := range sr.Filters {
-		key := strings.ToLower(k)
-		params[key] = v
+		params[strings.ToLower(k)] = v
 	}
 
-	if sr.Limit == 0 {
-		sr.Limit = 30
+	if sr.BeginDate != "" {
+		params["begin_date"] = sr.BeginDate
 	}
-	params["limit"] = strconv.Itoa(sr.Limit)
-	params["offset"] = strconv.Itoa(sr.Offset)
+	if sr.EndDate != "" {
+		params["end_date"] = sr.EndDate
+	}
+	if sr.Page != 0 {
+		params["page"] = strconv.Itoa(sr.Page)
+	}
+	if sr.PageSize != 0 {
+		params["page_size"] = strconv.Itoa(sr.PageSize)
+	}
+	if sr.SortBy != "" {
+		params["sort_by"] = sr.SortBy
+	}
+	if sr.SortOrder != "" {
+		params["sort_order"] = sr.SortOrder
+	}
+
+	_, hasPage := params["page"]
+	_, hasPageSize := params["page_size"]
+	if sr.Limit != 0 || sr.Offset != 0 || (!hasPage && !hasPageSize) {
+		limit := sr.Limit
+		if limit == 0 {
+			limit = 30
+		}
+		params["limit"] = strconv.Itoa(limit)
+		params["offset"] = strconv.Itoa(sr.Offset)
+	}
 
 	return params
 }
