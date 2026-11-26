@@ -72,7 +72,10 @@ type Client interface {
 	// It is a DELETE request to the endpoint: https://api.mercadopago.com/v1/orders/{orderID}/transactions/{transactionID}
 	DeleteTransaction(ctx context.Context, orderID string, transactionID string) error
 
-	// Search finds orders that match the given filter criteria and pagination parameters.
+	// Search finds orders matching the given filters and pagination parameters.
+	// SearchRequest encodes the documented page, page_size, sort_by and sort_order
+	// controls as query parameters alongside date filters; legacy limit and offset
+	// remain available for clients using offset-based pagination.
 	// It is a GET request to the endpoint: https://api.mercadopago.com/v1/orders
 	Search(ctx context.Context, request SearchRequest) (*SearchResponse, error)
 }
