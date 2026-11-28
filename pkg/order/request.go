@@ -1,6 +1,7 @@
 package order
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 )
@@ -9,6 +10,10 @@ import (
 // It contains all the information needed to describe the order, including total amount,
 // payment transactions, payer details, line items, and checkout configuration.
 type Request struct {
+	Splits              []SplitReceiverRequest `json:"splits,omitempty"`
+	Discounts           *DiscountsRequest      `json:"discounts,omitempty"`
+	// Taxes carries the payer's VAT condition for Point orders.
+	Taxes               []TaxRequest           `json:"taxes,omitempty"`
 	Type                string                 `json:"type,omitempty"`
 	TotalAmount         string                 `json:"total_amount,omitempty"`
 	ExternalReference   string                 `json:"external_reference,omitempty"`
@@ -29,6 +34,35 @@ type Request struct {
 	// IntegrationData contains integration metadata identifying the integrator, platform,
 	// corporation, and sponsor.
 	IntegrationData *IntegrationDataRequest `json:"integration_data,omitempty"`
+}
+
+// SplitReceiverRequest describes a receiver of a Split 1:N order.
+type SplitReceiverRequest struct {
+	ReceiverID   string `json:"receiver_id,omitempty"`
+	ReceiverType string `json:"receiver_type,omitempty"`
+	Amount       string `json:"amount,omitempty"`
+	Description  string `json:"description,omitempty"`
+}
+
+// SplitRulesRequest configures how amounts are assigned to split receivers.
+type SplitRulesRequest struct {
+	AmountType string `json:"amount_type,omitempty"`
+}
+
+// DiscountsRequest specifies totals discounted by QR payment method.
+type DiscountsRequest struct {
+	PaymentMethods []DiscountPaymentMethodRequest `json:"payment_methods,omitempty"`
+}
+
+// DiscountPaymentMethodRequest specifies the new total for a payment method type.
+type DiscountPaymentMethodRequest struct {
+	Type           string `json:"type,omitempty"`
+	NewTotalAmount string `json:"new_total_amount,omitempty"`
+}
+
+// TaxRequest specifies the payer's VAT condition for a Point or QR order.
+type TaxRequest struct {
+	PayerCondition string `json:"payer_condition,omitempty"`
 }
 
 // TravelPassengerRequest represents a passenger in a travel-related order.
@@ -95,6 +129,25 @@ type AdditionalInfoRequest struct {
 	PlatformAuthentication             string                    `json:"platform.authentication,omitempty"`
 	TravelPassengers                   *[]TravelPassengerRequest `json:"travel.passengers,omitempty"`
 	TravelRoutes                       *[]TravelRouterRequest    `json:"travel.routes,omitempty"`
+	SubMerchant                        *SubMerchantRequest       `json:"sub_merchant,omitempty"`
+}
+
+// SubMerchantRequest identifies a Wallet Connect payment facilitator's sub-merchant.
+type SubMerchantRequest struct {
+	ID                string `json:"id,omitempty"`
+	LegalName         string `json:"legal_name,omitempty"`
+	MCC               string `json:"mcc,omitempty"`
+	Phone             string `json:"phone,omitempty"`
+	URL               string `json:"url,omitempty"`
+	AddressStreet     string `json:"address_street,omitempty"`
+	AddressDoorNumber int    `json:"address_door_number,omitempty"`
+	City              string `json:"city,omitempty"`
+	Country           string `json:"country,omitempty"`
+	RegionCode        string `json:"region_code,omitempty"`
+	RegionCodeISO     string `json:"region_code_iso,omitempty"`
+	Zip               string `json:"zip,omitempty"`
+	DocumentType      string `json:"document_type,omitempty"`
+	DocumentNumber    string `json:"document_number,omitempty"`
 }
 
 // TravelRouterRequest represents a travel route segment used within [AdditionalInfoRequest].
@@ -140,6 +193,18 @@ type FreeMethodRequest struct {
 // Each order may contain one or more payments, enabling split-payment scenarios.
 type TransactionRequest struct {
 	Payments []PaymentRequest `json:"payments,omitempty"`
+	CashOuts []CashOutRequest `json:"cash_outs,omitempty"`
+}
+
+// CashOutRequest describes a QR cash withdrawal transaction.
+type CashOutRequest struct {
+	Amount string `json:"amount,omitempty"`
+	AdditionalInfo *CashOutAdditionalInfoRequest `json:"additional_info,omitempty"`
+}
+
+// CashOutAdditionalInfoRequest contains metadata for a QR cash withdrawal.
+type CashOutAdditionalInfoRequest struct {
+	ExternalReference string `json:"external_reference,omitempty"`
 }
 
 // PaymentRequest represents an individual payment transaction within an order.
@@ -283,6 +348,37 @@ type ItemsRequest struct {
 // For a full refund, pass nil instead of a [RefundRequest] to [Client.Refund].
 type RefundRequest struct {
 	Transactions []RefundTransaction `json:"transactions,omitempty"`
+	// Splits selects Split 1:N receivers; omit Transactions when using it.
+	Splits []RefundSplitReceiver `json:"splits,omitempty"`
+	// CheckoutProSplits selects Checkout Pro users instead of receiver IDs.
+	// Use this field instead of Splits or Transactions for Checkout Pro split refunds.
+	CheckoutProSplits []RefundSplitUser `json:"-"`
+}
+
+// RefundSplitReceiver identifies a Split 1:N receiver to refund.
+type RefundSplitReceiver struct {
+	ReceiverID string `json:"receiver_id"`
+	Amount     string `json:"amount,omitempty"`
+}
+
+// RefundSplitUser identifies a Checkout Pro split participant to refund.
+type RefundSplitUser struct {
+	UserID int `json:"user_id"`
+	Amount string `json:"amount,omitempty"`
+}
+
+// MarshalJSON retains the existing transaction refund format while selecting
+// the appropriate split participant representation for Checkout Pro.
+func (r RefundRequest) MarshalJSON() ([]byte, error) {
+	if r.CheckoutProSplits != nil {
+		return json.Marshal(struct {
+			Splits []RefundSplitUser `json:"splits"`
+		}{Splits: r.CheckoutProSplits})
+	}
+	return json.Marshal(struct {
+		Transactions []RefundTransaction   `json:"transactions,omitempty"`
+		Splits       []RefundSplitReceiver `json:"splits,omitempty"`
+	}{Transactions: r.Transactions, Splits: r.Splits})
 }
 
 // RefundTransaction identifies a single transaction to refund and the amount to return.
@@ -295,6 +391,7 @@ type RefundTransaction struct {
 // ConfigRequest represents order-level configuration options, including payment method
 // restrictions and online checkout redirect URLs.
 type ConfigRequest struct {
+	SplitRules            *SplitRulesRequest          `json:"split_rules,omitempty"`
 	NotificationURL       string                      `json:"notification_url,omitempty"`
 	StatementDescriptor   string                      `json:"statement_descriptor,omitempty"`
 	DefaultPaymentDueDate string                      `json:"default_payment_due_date,omitempty"`
