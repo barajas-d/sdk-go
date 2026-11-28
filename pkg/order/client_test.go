@@ -546,6 +546,136 @@ func TestCreate(t *testing.T) {
 	}
 }
 
+// createOrderWire exercises the public client and compares the complete JSON body
+// sent through the configured requester, including omission of optional fields.
+func createOrderWire(t *testing.T, request Request, want map[string]any) {
+	t.Helper()
+	called := false
+	cfg := &config.Config{Requester: &httpclient.Mock{DoMock: func(req *http.Request) (*http.Response, error) {
+		called = true
+		if req.Method != http.MethodPost || req.URL.Path != "/v1/orders" {
+			t.Errorf("request = %s %s, want POST /v1/orders", req.Method, req.URL.Path)
+		}
+		var got map[string]any
+		if err := json.NewDecoder(req.Body).Decode(&got); err != nil {
+			t.Errorf("decode create body: %v", err)
+		} else if !reflect.DeepEqual(got, want) {
+			t.Errorf("create body = %#v, want %#v", got, want)
+		}
+		return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"id":"created-order","status":"processed"}`)), Header: make(http.Header)}, nil
+	}}}
+	got, err := NewClient(cfg).Create(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Create() error: %v", err)
+	}
+	if !called {
+		t.Fatal("configured requester was not called")
+	}
+	if got == nil || got.ID != "created-order" || got.Status != "processed" {
+		t.Errorf("Create() = %+v, want processed created-order", got)
+	}
+}
+
+func TestCreateSplitReceiversWire(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"split receivers", `{"type":"online","total_amount":"500.00","splits":[{"amount":"250.00","description":"Owner","receiver_id":"owner-1","receiver_type":"owner"},{"amount":"250.00","receiver_id":"partner-1","receiver_type":"partner"}],"config":{"split_rules":{"amount_type":"fixed"}}}`},
+		{"legacy order", `{"type":"online","total_amount":"500.00"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var request Request
+			if err := json.Unmarshal([]byte(tc.body), &request); err != nil {
+				t.Fatal(err)
+			}
+			var want map[string]any
+			if err := json.Unmarshal([]byte(tc.body), &want); err != nil {
+				t.Fatal(err)
+			}
+			createOrderWire(t, request, want)
+		})
+	}
+}
+
+func TestCreatePointOrderWire(t *testing.T) {
+	request := Request{Type: "point", TotalAmount: "120.00", Transactions: &TransactionRequest{Payments: []PaymentRequest{{Amount: "120.00"}}}}
+	createOrderWire(t, request, map[string]any{"type": "point", "total_amount": "120.00", "transactions": map[string]any{"payments": []any{map[string]any{"amount": "120.00"}}}})
+	createOrderWire(t, Request{Type: "point", TotalAmount: "120.00"}, map[string]any{"type": "point", "total_amount": "120.00"})
+	request.Taxes = []TaxRequest{{PayerCondition: "registered"}}
+	createOrderWire(t, request, map[string]any{"type": "point", "total_amount": "120.00", "transactions": map[string]any{"payments": []any{map[string]any{"amount": "120.00"}}}, "taxes": []any{map[string]any{"payer_condition": "registered"}}})
+	request.Taxes = []TaxRequest{{PayerCondition: "payment_exempt_iva"}}
+	createOrderWire(t, request, map[string]any{"type": "point", "total_amount": "120.00", "transactions": map[string]any{"payments": []any{map[string]any{"amount": "120.00"}}}, "taxes": []any{map[string]any{"payer_condition": "payment_exempt_iva"}}})
+	request.Taxes = []TaxRequest{{PayerCondition: "payment_taxable_iva"}}
+	createOrderWire(t, request, map[string]any{"type": "point", "total_amount": "120.00", "transactions": map[string]any{"payments": []any{map[string]any{"amount": "120.00"}}}, "taxes": []any{map[string]any{"payer_condition": "payment_taxable_iva"}}})
+}
+
+func TestCreateQRDiscountsWire(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"discounts", `{"type":"qr","discounts":{"payment_methods":[{"type":"debit_card","new_total_amount":"90.00"},{"type":"credit_card","new_total_amount":"91.00"},{"type":"account_money","new_total_amount":"92.00"},{"type":"prepaid_card","new_total_amount":"93.00"}]}}`},
+		{"legacy order", `{"type":"qr"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var request Request
+			if err := json.Unmarshal([]byte(tc.body), &request); err != nil {
+				t.Fatal(err)
+			}
+			var want map[string]any
+			if err := json.Unmarshal([]byte(tc.body), &want); err != nil {
+				t.Fatal(err)
+			}
+			createOrderWire(t, request, want)
+		})
+	}
+}
+
+func TestCreateQRCashOutWire(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"cash out", `{"type":"qr","transactions":{"cash_outs":[{"amount":"20.00","additional_info":{"external_reference":"cash-ref"}}]}}`},
+		{"legacy payment", `{"type":"qr","transactions":{"payments":[{"amount":"20.00"}]}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var request Request
+			if err := json.Unmarshal([]byte(tc.body), &request); err != nil {
+				t.Fatal(err)
+			}
+			var want map[string]any
+			if err := json.Unmarshal([]byte(tc.body), &want); err != nil {
+				t.Fatal(err)
+			}
+			createOrderWire(t, request, want)
+		})
+	}
+}
+
+func TestCreateWalletConnectSubMerchantWire(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"sub merchant", `{"type":"online","additional_info":{"sub_merchant":{"address_street":"Main Street","document_type":"CPF","document_number":"12345678909"}}}`},
+		{"legacy order", `{"type":"online"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var request Request
+			if err := json.Unmarshal([]byte(tc.body), &request); err != nil {
+				t.Fatal(err)
+			}
+			var want map[string]any
+			if err := json.Unmarshal([]byte(tc.body), &want); err != nil {
+				t.Fatal(err)
+			}
+			createOrderWire(t, request, want)
+		})
+	}
+}
+
 func TestCheckoutProRequestJSON(t *testing.T) {
 	localPickup := true
 	freeShipping := true
@@ -1453,6 +1583,139 @@ func TestRefund(t *testing.T) {
 				t.Errorf("Refund() got = %v, want = %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRefundSplitReceiversWire(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		request *RefundRequest
+		body map[string]any
+	}{
+		{
+			name: "receiver with amount",
+			request: &RefundRequest{Splits: []RefundSplitReceiver{{ReceiverID: "receiver-1", Amount: "25.00"}}},
+			body: map[string]any{"splits": []any{map[string]any{"receiver_id": "receiver-1", "amount": "25.00"}}},
+		},
+		{
+			name: "receiver without amount",
+			request: &RefundRequest{Splits: []RefundSplitReceiver{{ReceiverID: "receiver-2"}}},
+			body: map[string]any{"splits": []any{map[string]any{"receiver_id": "receiver-2"}}},
+		},
+		{
+			name: "legacy transaction",
+			request: &RefundRequest{Transactions: []RefundTransaction{{ID: "payment-1", Amount: "10.00"}}},
+			body: map[string]any{"transactions": []any{map[string]any{"id": "payment-1", "amount": "10.00"}}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			cfg := &config.Config{Requester: &httpclient.Mock{DoMock: func(req *http.Request) (*http.Response, error) {
+				called = true
+				if req.Method != http.MethodPost || req.URL.Path != "/v1/orders/order-1/refund" {
+					t.Errorf("request = %s %s, want POST /v1/orders/order-1/refund", req.Method, req.URL.Path)
+				}
+				var body map[string]any
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					t.Errorf("decode refund body: %v", err)
+				} else if !reflect.DeepEqual(body, tc.body) {
+					t.Errorf("refund body = %#v, want %#v", body, tc.body)
+				}
+				return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"id":"order-1","status":"refunded","status_detail":"partially_refunded"}`)), Header: make(http.Header)}, nil
+			}}}
+			got, err := NewClient(cfg).Refund(context.Background(), "order-1", tc.request)
+			if err != nil {
+				t.Fatalf("Refund() error: %v", err)
+			}
+			if !called {
+				t.Fatal("configured requester was not called")
+			}
+			if got == nil || got.ID != "order-1" || got.Status != "refunded" || got.StatusDetail != "partially_refunded" {
+				t.Errorf("Refund() = %+v, want refunded order-1 with partially_refunded detail", got)
+			}
+		})
+	}
+}
+
+func TestRefundCheckoutProSplitUsersWire(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		request *RefundRequest
+		body map[string]any
+	}{
+		{
+			name: "user with amount",
+			request: &RefundRequest{CheckoutProSplits: []RefundSplitUser{{UserID: 123, Amount: "50.00"}}},
+			body: map[string]any{"splits": []any{map[string]any{"user_id": float64(123), "amount": "50.00"}}},
+		},
+		{
+			name: "user without amount",
+			request: &RefundRequest{CheckoutProSplits: []RefundSplitUser{{UserID: 456}}},
+			body: map[string]any{"splits": []any{map[string]any{"user_id": float64(456)}}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			cfg := &config.Config{Requester: &httpclient.Mock{DoMock: func(req *http.Request) (*http.Response, error) {
+				called = true
+				if req.Method != http.MethodPost || req.URL.Path != "/v1/orders/checkout-order/refund" {
+					t.Errorf("request = %s %s, want POST /v1/orders/checkout-order/refund", req.Method, req.URL.Path)
+				}
+				var body map[string]any
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					t.Errorf("decode refund body: %v", err)
+				} else if !reflect.DeepEqual(body, tc.body) {
+					t.Errorf("refund body = %#v, want %#v", body, tc.body)
+				}
+				return &http.Response{StatusCode: http.StatusCreated, Body: io.NopCloser(strings.NewReader(`{"id":"checkout-order","status":"refunded"}`)), Header: make(http.Header)}, nil
+			}}}
+			got, err := NewClient(cfg).Refund(context.Background(), "checkout-order", tc.request)
+			if err != nil {
+				t.Fatalf("Refund() error: %v", err)
+			}
+			if !called {
+				t.Fatal("configured requester was not called")
+			}
+			if got == nil || got.ID != "checkout-order" || got.Status != "refunded" {
+				t.Errorf("Refund() = %+v, want refunded checkout-order", got)
+			}
+		})
+	}
+}
+
+func TestOrderEventsWire(t *testing.T) {
+	called := false
+	cfg := &config.Config{Requester: &httpclient.Mock{DoMock: func(req *http.Request) (*http.Response, error) {
+		called = true
+		if req.Method != http.MethodPost || req.URL.Path != "/v1/orders/point-order/events" {
+			t.Errorf("request = %s %s, want POST /v1/orders/point-order/events", req.Method, req.URL.Path)
+		}
+		if req.URL.Host != "api.mercadopago.com" {
+			t.Errorf("events host = %q, want api.mercadopago.com", req.URL.Host)
+		}
+		var got map[string]any
+		if err := json.NewDecoder(req.Body).Decode(&got); err != nil {
+			t.Errorf("decode events body: %v", err)
+		} else {
+			want := map[string]any{"status": "processed", "status_detail": "accredited", "payment_method_id": "visa", "payment_method_type": "credit_card", "installments": float64(2)}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("events body = %#v, want %#v", got, want)
+			}
+		}
+		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody, Header: make(http.Header)}, nil
+	}}}
+	var base Client = NewClient(cfg)
+	events, ok := base.(EventsClient)
+	if !ok {
+		t.Fatal("NewClient does not implement EventsClient")
+	}
+	if err := events.Events(context.Background(), "point-order", EventsRequest{
+		Status: "processed", StatusDetail: "accredited", PaymentMethodID: "visa", PaymentMethodType: "credit_card", Installments: 2,
+	}); err != nil {
+		t.Fatalf("Events() on HTTP 204: %v", err)
+	}
+	if !called {
+		t.Fatal("configured requester was not called")
 	}
 }
 

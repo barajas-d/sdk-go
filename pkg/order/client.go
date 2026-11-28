@@ -77,6 +77,20 @@ type Client interface {
 	Search(ctx context.Context, request SearchRequest) (*SearchResponse, error)
 }
 
+// EventsRequest describes a Point test-order status simulation.
+type EventsRequest struct {
+	Status            string `json:"status"`
+	StatusDetail      string `json:"status_detail,omitempty"`
+	PaymentMethodID   string `json:"payment_method_id,omitempty"`
+	PaymentMethodType string `json:"payment_method_type,omitempty"`
+	Installments      int    `json:"installments,omitempty"`
+}
+
+// EventsClient exposes Point test-order status simulation without changing Client.
+type EventsClient interface {
+	Events(ctx context.Context, orderID string, request EventsRequest) error
+}
+
 // client is the implementation of [Client].
 type client struct {
 	cfg *config.Config
@@ -240,6 +254,19 @@ func (c *client) Refund(ctx context.Context, orderID string, request *RefundRequ
 	}
 
 	return resource, nil
+}
+
+// Events simulates the final status of a Point test order.
+func (c *client) Events(ctx context.Context, orderID string, request EventsRequest) error {
+	requestData := httpclient.RequestData{
+		Method:     http.MethodPost,
+		URL:        urlWithOrderID + "/events",
+		PathParams: map[string]string{"orderID": orderID},
+		Body:       request,
+	}
+
+	_, err := httpclient.DoRequest[any](ctx, c.cfg, requestData)
+	return err
 }
 
 func (c *client) DeleteTransaction(ctx context.Context, orderID string, transactionID string) error {
